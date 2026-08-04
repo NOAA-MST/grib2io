@@ -82,7 +82,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "--filters",
         nargs="+",
         metavar="key=value",
-        help="Filter GRIB2 messages by metadata attributes (e.g. --filters shortName=TMP level=500).",
+        help="Filter GRIB2 messages by metadata attributes (e.g. --filters shortName=TMP level='500 mb').",
     )
     p.add_argument(
         "files",

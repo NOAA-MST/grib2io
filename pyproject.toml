@@ -2,26 +2,34 @@
 requires = [
   "Cython>=3",
   "numpy",
-  "scikit-build-core>=0.10",
+  "scikit-build-core>=1.0",
 ]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "grib2io"
-version = "2.7.0"
+dynamic = ["version"]
 description = "Python interface to the NCEP G2C Library for reading/writing GRIB2 files."
 authors = [
-  {name = "Eric Engle", email = "eric.engle@noaa.gov"},
-  {name = "Adam Schnapp", email = "adam.schnapp@noaa.gov"},
+  { name = "Eric Engle", email = "eric.engle@noaa.gov" },
+  { name = "Adam Schnapp", email = "adam.schnapp@noaa.gov" },
 ]
 requires-python = ">=3.8,<3.15"
 keywords = [
-  "weather", "data-science", "numpy", "meteorology", "weather-data", "atmospheric-science",
-  "grib2", "grib2-decoder", "grib2-encoder", "ncep",
+  "weather",
+  "data-science",
+  "numpy",
+  "meteorology",
+  "weather-data",
+  "atmospheric-science",
+  "grib2",
+  "grib2-decoder",
+  "grib2-encoder",
+  "ncep",
 ]
 readme = "README.md"
-license = {text = "MIT"}
-#FUTURE license-files = ["LICENSE"]
+license = { text = "MIT" }
+# FUTURE: license-files = ["LICENSE"]
 classifiers = [
   "Development Status :: 5 - Production/Stable",
   "Environment :: Console",
@@ -48,12 +56,40 @@ dependencies = [
   "pyproj",
 ]
 
-[project.optional-dependencies]
+[[tool.dynamic-metadata]]
+provider = "scikit_build_core.metadata.regex"
+field = "version"
+input = "VERSION"
+regex = '^(?P<value>\S+)\s*$'
 
-xarray = ["xarray"]
-kerchunk = ["kerchunk", "numcodecs"]
-test = ["pytest", "s3fs", "dask", "distributed", "cython", "xarray", "kerchunk", "dask[complete]"]
-demo = ["xarray", "kerchunk", 'virtualizarr', 'matplotlib', 'cartopy', 'jupyterlab', 'geoviews', 'hvplot']
+[project.optional-dependencies]
+xarray = [
+  "xarray",
+]
+kerchunk = [
+  "kerchunk",
+  "numcodecs",
+]
+test = [
+  "pytest",
+  "s3fs",
+  "dask",
+  "distributed",
+  "cython",
+  "xarray",
+  "kerchunk",
+  "dask[complete]",
+]
+demo = [
+  "xarray",
+  "kerchunk",
+  "virtualizarr",
+  "matplotlib",
+  "cartopy",
+  "jupyterlab",
+  "geoviews",
+  "hvplot",
+]
 all = [
   "xarray",
   "kerchunk",
@@ -76,11 +112,11 @@ all = [
 grib2io = "grib2io.xarray_backend:GribBackendEntrypoint"
 
 [project.entry-points."numcodecs.codecs"]
-# Make the Zarr v2 / numcodecs GRIB2 codec auto-discoverable.  numcodecs
+# Make the Zarr v2 / numcodecs GRIB2 codec auto-discoverable. numcodecs
 # lazily loads codecs from this entry-point group the first time it sees an
-# unknown codec id (here ``grib2io``) in a ``.zarray``'s compressor/filters,
-# so a plain ``xr.open_zarr`` on a grib2io Kerchunk reference can decode GRIB2
-# chunks WITHOUT a prior ``import grib2io.codecs``.
+# unknown codec ID (here "grib2io") in a ".zarray" compressor/filters, so a
+# plain "xr.open_zarr" on a grib2io Kerchunk reference can decode GRIB2 chunks
+# without a prior "import grib2io.codecs".
 grib2io = "grib2io.codecs:Grib2Codec"
 
 [project.entry-points."zarr.codecs"]
@@ -95,6 +131,7 @@ Documentation = "https://noaa-mdl.github.io/grib2io"
 Repository = "https://github.com/NOAA-MDL/grib2io"
 
 [tool.scikit-build]
+minimum-version = "build-system.requires"
 cmake.version = ">=3.18"
 wheel.packages = ["src/grib2io"]
 sdist.include = [
@@ -113,10 +150,9 @@ line-length = 150
 
 [tool.ruff.lint]
 ignore = [
-    "D",    # Ignore all docstring-related rules (D prefix)
-    #"E501", # Ignore line-too-long (handled by formatter)
-    "F401", # Ignore unused imports
-    "F811", # Ignore redefinition
+  "D",    # Ignore all docstring-related rules (D prefix)
+  # "E501", # Ignore line-too-long (handled by formatter)
+  "F401", # Ignore unused imports
+  "F811", # Ignore redefinition
 ]
-select = ["E4", "E7", "E9", "F"] # preserve ruff < 0.16.0 rules
-
+select = ["E4", "E7", "E9", "F"] # Preserve Ruff < 0.16.0 rules

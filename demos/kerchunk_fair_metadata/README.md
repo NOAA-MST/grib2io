@@ -12,6 +12,7 @@ already decoded by grib2io from the GRIB2 message in hand.
   - [New: root-level dataset metadata](#new-root-level-dataset-metadata)
   - [Enriched: per-variable metadata](#enriched-per-variable-metadata)
 - [Field reference](#field-reference)
+- [Setup: install this branch](#setup-install-this-branch)
 - [How to generate a manifest](#how-to-generate-a-manifest)
 - [How to open a manifest](#how-to-open-a-manifest)
 - [Example files in this directory](#example-files-in-this-directory)
@@ -136,6 +137,43 @@ Only keys that decode successfully are emitted, so a manifest never carries
 Retained GRIB2-native keys: `discipline`, `parameterCategory`, `parameterNumber`,
 `typeOfFirstFixedSurface`, `valueOfFirstFixedSurface`, `shortName`, `valid_time`,
 `coordinates`, `_ARRAY_DIMENSIONS`.
+
+---
+
+## Setup: install this branch
+
+grib2io builds a C extension that links the **NCEPLIBS-g2c** library, so its
+build/runtime dependencies are easiest to get from conda-forge. A conda
+environment is recommended.
+
+```bash
+# 1. Get the code and check out the feature branch
+git clone https://github.com/<you>/grib2io.git
+cd grib2io
+git checkout feature/kerchunk-fair-metadata
+
+# 2. Create an environment with the compiled build dependencies
+conda create -n grib2io -c conda-forge python=3.12 \
+    c-compiler cmake nceplibs-g2c
+conda activate grib2io
+
+# 3. Install this checkout in editable mode with the extras used here.
+#    - kerchunk : reference generation (kerchunk, numcodecs, fsspec)
+#    - xarray   : opening a manifest as a virtual Zarr store
+pip install -e '.[kerchunk,xarray]'
+```
+
+Verify the install and that the kerchunk subcommand is available:
+
+```bash
+python -c "import grib2io; print(grib2io.__version__)"
+grib2io kerchunk --help
+```
+
+> Already have a working grib2io conda env? Then you only need to
+> `git checkout feature/kerchunk-fair-metadata` and
+> `pip install -e '.[kerchunk,xarray]'` inside it — conda has already provided
+> the compiled g2c dependency.
 
 ---
 

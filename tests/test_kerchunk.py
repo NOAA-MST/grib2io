@@ -739,3 +739,106 @@ def test_standard_zarr_open(gfs_jpeg_path, tmp_path):
     data = ds[var_name].values
     assert data is not None
     assert data.ndim == 4
+
+
+# ---------------------------------------------------------------------------
+# FAIR metadata enrichment tests (root .zattrs + CF variable attributes)
+# ---------------------------------------------------------------------------
+
+
+def _data_var_zattrs(refs):
+    """Yield (name, zattrs) for every data variable (arrays with y, x dims)."""
+    for key in refs:
+        if not key.endswith("/.zattrs"):
+            continue
+        zattrs = json.loads(refs[key])
+        dims = zattrs.get("_ARRAY_DIMENSIONS", [])
+        if dims[-2:] == ["y", "x"] and len(dims) > 2:
+            yield key.rsplit("/.zattrs", 1)[0], zattrs
+
+
+class TestRootZattrs:
+    """The manifest carries dataset-level (root) metadata making it
+    self-describing when separated from its filename."""
+
+    def test_root_zattrs_present(self, gfs_complex_path):
+        refs = ReferenceGenerator([gfs_complex_path]).generate()["refs"]
+        assert ".zattrs" in refs, "manifest must carry root .zattrs"
+        root = json.loads(refs[".zattrs"])
+        assert root["Conventions"] == "CF-1.8"
+
+    def test_root_zattrs_identification_fields(self, gfs_complex_path):
+        """Decoded Section 0/1/4 identification metadata is present."""
+        refs = ReferenceGenerator([gfs_complex_path]).generate()["refs"]
+        root = json.loads(refs[".zattrs"])
+
+        # Originating center decodes to NCEP for the GFS sample.
+        assert "NCEP" in root["institution"]
+        # Generating process (model) is a non-empty decoded string.
+        assert isinstance(root["source"], str) and root["source"]
+        # Reference cycle time is ISO 8601.
+        assert root["reference_time"] == "2020-10-26T00:00:00"
+        assert root["reference_time_significance"] == "Start of Forecast"
+        assert root["production_status"] == "Operational Products"
+        assert root["type_of_data"] == "Forecast Products"
+        # Table versions are integer codes.
+        assert isinstance(root["GRIB2_master_table_version"], int)
+        assert isinstance(root["GRIB2_local_table_version"], int)
+
+
+class TestVariableCfZattrs:
+    """Variable .zattrs expose CF vocabulary alongside GRIB2-native keys."""
+
+    def test_cf_and_grib_keys_coexist(self, gfs_complex_path):
+        refs = ReferenceGenerator([gfs_complex_path]).generate()["refs"]
+        for name, z in _data_var_zattrs(refs):
+            # CF vocabulary
+            assert "standard_name" in z, f"{name} missing standard_name"
+            assert z["long_name"], f"{name} missing long_name"
+            assert isinstance(z["level"], str), f"{name} missing level string"
+            assert "lead_time_hours" in z, f"{name} missing lead_time_hours"
+            # GRIB2-native provenance retained for Reusability
+            for k in ("discipline", "parameterCategory", "parameterNumber",
+                      "shortName", "valid_time"):
+                assert k in z, f"{name} missing GRIB2 key {k}"
+
+    def test_geopotential_height_standard_name(self, gfs_complex_path):
+        """The HGT sample maps to the correct CF standard name and level."""
+        refs = ReferenceGenerator([gfs_complex_path]).generate()["refs"]
+        hgt = dict(_data_var_zattrs(refs))["HGT"]
+        assert hgt["standard_name"] == "geopotential_height"
+        assert hgt["long_name"] == "Geopotential Height"
+        assert hgt["level"] == "500 mb"
+
+    def test_statistical_variable_cell_methods_and_duration(self):
+        """An accumulation variable (APCP) exposes cell_methods and a
+        processing duration."""
+        path = os.path.join(INPUT_DATA, "blend.t00z.core.f001.co_4x_reduce.grib2")
+        if not os.path.isfile(path):
+            pytest.skip("blend statistical test file not available")
+        refs = ReferenceGenerator([path], filters={"shortName": "APCP"}).generate()["refs"]
+        apcp = [z for name, z in _data_var_zattrs(refs) if z["shortName"] == "APCP"]
+        assert apcp, "expected at least one APCP variable"
+        for z in apcp:
+            assert z["cell_methods"] == "time: sum"
+            assert z["duration_hours"] > 0
+
+    def test_root_and_cf_attrs_survive_xarray_open(self, gfs_complex_path, tmp_path):
+        """Enriched attributes flow through an fsspec/xarray round trip."""
+        import fsspec
+        import xarray as xr
+        import grib2io.codecs  # noqa: F401  (force codec registration)
+
+        gen = ReferenceGenerator([gfs_complex_path])
+        gen.generate()
+        json_path = str(tmp_path / "refs.json")
+        gen.to_json(json_path)
+
+        fs = fsspec.filesystem("reference", fo=json_path)
+        ds = xr.open_dataset(fs.get_mapper(""), engine="zarr", consolidated=False)
+
+        assert ds.attrs["Conventions"] == "CF-1.8"
+        assert "institution" in ds.attrs
+        var = list(ds.data_vars)[0]
+        assert "standard_name" in ds[var].attrs
+        assert "long_name" in ds[var].attrs

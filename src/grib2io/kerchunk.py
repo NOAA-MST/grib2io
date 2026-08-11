@@ -231,6 +231,12 @@ class ReferenceGenerator:
             rep_msg = first_entries[0].msg
             _build_latlon_coord_refs(rep_msg, refs)
 
+            # Root-level dataset metadata (CF global attributes + GRIB2
+            # provenance from Sections 0/1/4).  Without this, a manifest
+            # separated from its filename carries no record of which model,
+            # center, or cycle it describes.
+            refs[".zattrs"] = json.dumps(_build_root_zattrs(rep_msg))
+
         self._manifest = {"version": 1, "refs": refs}
         return self._manifest
 
@@ -910,6 +916,136 @@ def _build_zarray_metadata(
     }
 
 
+def _decode(md: Any) -> Optional[str]:
+    """Return the plain-language definition of a ``Grib2Metadata`` value.
+
+    grib2io stores coded metadata as :class:`grib2io.templates.Grib2Metadata`
+    objects whose ``definition`` attribute is the decoded string.  Some code
+    tables (e.g. Table 4.5) return a ``[definition, units]`` list; in that case
+    only the description is taken.  Returns ``None`` when no definition exists.
+    """
+    if md is None:
+        return None
+    d = getattr(md, "definition", md)
+    if isinstance(d, (list, tuple)):
+        d = d[0] if d else None
+    if d is None:
+        return None
+    return str(d)
+
+
+def _cf_standard_name(msg) -> str:
+    """Return the CF standard name for a message, or ``"unknown"``.
+
+    Mirrors the lookup used by grib2io's xarray backend so that manifests and
+    the native backend agree on the CF vocabulary.
+    """
+    record = grib2io.tables.get_table("shortname_to_cf").get(str(msg.shortName))
+    if record is None:
+        return "unknown"
+    return record.get("cf_standard_name") or "unknown"
+
+
+def _cf_cell_methods(msg) -> Optional[str]:
+    """Return the CF ``cell_methods`` string for a message, if any."""
+    record = grib2io.tables.get_table("shortname_to_cf").get(str(msg.shortName))
+    if record is None:
+        return None
+    return record.get("cf_cell_methods")
+
+
+def _level_string(msg) -> str:
+    """Return the human-readable wgrib2-style level/layer description.
+
+    Uses grib2io's ``Level`` descriptor (e.g. ``"500 mb"``,
+    ``"2 m above ground"``), which is far more usable than the raw
+    ``typeOfFirstFixedSurface`` code and ``valueOfFirstFixedSurface``.
+    """
+    try:
+        return str(msg.level)
+    except Exception:
+        return ""
+
+
+def _timedelta_hours(td: Any) -> Optional[float]:
+    """Convert a ``timedelta``-like value to hours, or ``None``.
+
+    Returns a plain ``float`` (whole hours collapse to e.g. ``24.0``) suitable
+    for JSON serialization; returns ``None`` when the value is missing or not a
+    duration.
+    """
+    if td is None:
+        return None
+    total = getattr(td, "total_seconds", None)
+    if total is None:
+        return None
+    return total() / 3600.0
+
+
+def _build_root_zattrs(msg) -> dict:
+    """Build root-level (dataset) Zarr attributes from a representative message.
+
+    Combines CF global attributes with GRIB2 identification metadata decoded
+    from Sections 0/1/4.  This makes a manifest self-describing: which center
+    produced it, from what model, for which reference cycle, and under what
+    table versions — none of which the per-variable attributes capture.
+
+    Parameters
+    ----------
+    msg : Grib2Message
+        Representative message (all messages in a manifest are assumed to share
+        the same originating center, model, and reference time).
+
+    Returns
+    -------
+    dict
+        Root ``.zattrs`` metadata.
+    """
+    # Institution: originating center, with sub-center appended when defined.
+    institution = _decode(getattr(msg, "originatingCenter", None))
+    subcenter = _decode(getattr(msg, "originatingSubCenter", None))
+    if institution and subcenter:
+        institution = f"{institution} / {subcenter}"
+
+    # Reference time (model cycle) as ISO 8601.
+    ref = getattr(msg, "refDate", None)
+    if hasattr(ref, "isoformat"):
+        reference_time = ref.isoformat()
+    elif ref is not None:
+        reference_time = str(ref)
+    else:
+        reference_time = None
+
+    zattrs: Dict[str, Any] = {"Conventions": "CF-1.8"}
+
+    # Only emit keys we could actually decode, so consumers never see
+    # placeholder/None values in the manifest.
+    for key, value in [
+        ("institution", institution),
+        ("source", _decode(getattr(msg, "generatingProcess", None))),
+        ("reference_time", reference_time),
+        ("reference_time_significance", _decode(getattr(msg, "significanceOfReferenceTime", None))),
+        ("production_status", _decode(getattr(msg, "productionStatus", None))),
+        ("type_of_data", _decode(getattr(msg, "typeOfData", None))),
+    ]:
+        if value is not None:
+            zattrs[key] = value
+
+    # GRIB2 table versions (numeric codes) for full reproducibility.
+    master = getattr(msg, "masterTableInfo", None)
+    if master is not None:
+        zattrs["GRIB2_master_table_version"] = int(getattr(master, "value", master))
+    local = getattr(msg, "localTableInfo", None)
+    if local is not None:
+        zattrs["GRIB2_local_table_version"] = int(getattr(local, "value", local))
+
+    version = getattr(grib2io, "__version__", None)
+    if version:
+        zattrs["grib2io_version"] = str(version)
+
+    return zattrs
+
+
 def _build_zattrs(msg, dim_labels: List[str]) -> dict:
     """Extract GRIB2 section metadata as Zarr attributes.
 
@@ -949,19 +1085,42 @@ def _build_zattrs(msg, dim_labels: List[str]) -> dict:
     else:
         valid_time_str = str(vt)
 
-    return {
+    zattrs = {
         "_ARRAY_DIMENSIONS": dim_labels,
         "coordinates": "latitude longitude",
+        # CF vocabulary (Interoperable) -----------------------------------
+        "standard_name": _cf_standard_name(msg),
+        "long_name": str(msg.fullName),
+        "units": str(msg.units),
+        # GRIB2-native provenance (kept alongside CF for Reusability) -----
         "discipline": int(msg.section0[2]),
         "parameterCategory": int(msg.parameterCategory),
         "parameterNumber": int(msg.parameterNumber),
         "typeOfFirstFixedSurface": int(type_of_first_fixed_surface),
         "valueOfFirstFixedSurface": float(value_of_first_fixed_surface),
-        "valid_time": valid_time_str,
+        "level": _level_string(msg),
         "shortName": str(msg.shortName),
-        "fullName": str(msg.fullName),
-        "units": str(msg.units),
+        "valid_time": valid_time_str,
     }
+
+    # Representative forecast lead time.  Distinguishes an f000 manifest from
+    # an f384 one, which is otherwise only recoverable from the filename.
+    lead_hours = _timedelta_hours(getattr(msg, "leadTime", None))
+    if lead_hours is not None:
+        zattrs["lead_time_hours"] = lead_hours
+
+    # Statistical processing period (e.g. accumulation/max/min window); only
+    # meaningful for messages that carry one.
+    dur_hours = _timedelta_hours(getattr(msg, "duration", None))
+    if dur_hours:
+        zattrs["duration_hours"] = dur_hours
+
+    # CF cell_methods only when the parameter defines one (e.g. time: maximum).
+    cell_methods = _cf_cell_methods(msg)
+    if cell_methods:
+        zattrs["cell_methods"] = cell_methods
+
+    return zattrs
 
 
 def _build_codec_config(entry: _MsgEntry) -> dict:

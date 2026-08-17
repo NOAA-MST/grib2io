@@ -453,6 +453,13 @@ class ReferenceGenerator:
             index, msgs = self._build_remote_index_filtered(file_path, shortname_filter, scan_storage_options)
 
         n_msgs = len(msgs)
+
+        # GRIB2 submessages may omit Section 3 and inherit the grid definition
+        # of the message before them, so index["section3"] is not necessarily
+        # parallel to the message list and must not be indexed by the message
+        # counter.  Resolve each message to its own Section 3 entry first.
+        sec3_map = _build_section3_map(index, n_msgs)
+
         for i in range(n_msgs):
             msg = msgs[i]
 
@@ -516,7 +523,7 @@ class ReferenceGenerator:
                 sec7_length=sec7_length,
                 sec6_offset=sec6_offset,
                 bmapflag=bmapflag,
-                index_section3=index["section3"][i],
+                index_section3=index["section3"][sec3_map[i]],
                 index_section5=index["section5"][i],
             )
 
@@ -611,6 +618,19 @@ class ReferenceGenerator:
         # Build .zattrs
         dim_labels = dim_names + ["y", "x"]
         zattrs = _build_zattrs(rep_msg, dim_labels)
+
+        # ``level`` and ``valueOfFirstFixedSurface`` describe the representative
+        # message only.  When several messages are folded into one array along a
+        # level dimension they are correct for the first level and wrong for
+        # every other one, so a consumer reading attributes instead of the
+        # coordinate array is misled (e.g. a 41-level pressure array labelled
+        # "0.01 mb").  Drop them here and let the level coordinate carry the
+        # information instead — see _build_coord_refs / _level_coord_attrs.
+        n_levels = len(dim_values.get(level_name, ()))
+        if n_levels > 1:
+            for _key in ("level", "valueOfFirstFixedSurface"):
+                zattrs.pop(_key, None)
+
         refs[f"{var_name}/.zattrs"] = json.dumps(zattrs)
 
         # Build data chunk refs
@@ -637,7 +657,7 @@ class ReferenceGenerator:
         # Build coordinate arrays as inline base64-encoded refs
         for dim_name in dim_names:
             values = dim_values[dim_name]
-            _build_coord_refs(dim_name, values, refs)
+            _build_coord_refs(dim_name, values, refs, msg=rep_msg, level_dim_name=level_name)
 
     # ------------------------------------------------------------------
     # Manifest access
@@ -716,6 +736,66 @@ def _is_local_path(path: str) -> bool:
     """Return ``True`` if *path* looks like a local filesystem path."""
     parsed = urlparse(path)
     return parsed.scheme == ""
+
+
+def _build_section3_map(index: dict, n_msgs: int) -> List[int]:
+    """Map each message index onto its entry in ``index["section3"]``.
+
+    ``build_index`` appends to ``index["section3"]`` only when it actually
+    reads a Section 3.  After a message ends, the trailer check reads the next
+    section number, which may be 2, 3, or 4:
+
+    * ``nextsec == 4`` — Sections 2 and 3 are not repeated and the submessage
+      inherits the preceding grid definition, so ``section3`` does not grow.
+    * ``nextsec == 3`` — Section 3 is re-read and appended, so it does grow.
+    * ``nextsec == 2`` — Section 2 repeats and Section 3 follows, so it grows.
+
+    ``_isSubmessage`` is set for all three, which is why a counter keyed on it
+    is only correct for the first case.  ``sectionOffset[i][3]`` is deep-copied
+    per message and retains the previous Section 3 offset when a submessage
+    omits it, so distinct offsets in order of first appearance correspond
+    one-to-one with the appended Section 3 entries.  Mapping through the offset
+    is therefore correct in all three cases.
+
+    Parameters
+    ----------
+    index : dict
+        The grib2io file index.
+    n_msgs : int
+        Number of messages in the file.
+
+    Returns
+    -------
+    list of int
+        ``sec3_map[i]`` is the index into ``index["section3"]`` for message
+        ``i``.  Reduces to the identity mapping when no submessages are present.
+    """
+    n_sec3 = len(index.get("section3", ()))
+    if n_sec3 == 0:
+        return [0] * n_msgs
+
+    # Fast path: no submessages, so the lists are already parallel.
+    if n_sec3 == n_msgs:
+        return list(range(n_msgs))
+
+    offsets = index.get("sectionOffset")
+    if offsets is None:
+        # Nothing to map through; clamp so a malformed index degrades to the
+        # last known grid definition rather than raising IndexError.
+        return [min(i, n_sec3 - 1) for i in range(n_msgs)]
+
+    seen: Dict[int, int] = {}
+    sec3_map: List[int] = []
+    for i in range(n_msgs):
+        try:
+            off = int(offsets[i][3])
+        except (IndexError, KeyError, TypeError, ValueError):
+            sec3_map.append(sec3_map[-1] if sec3_map else 0)
+            continue
+        if off not in seen:
+            seen[off] = min(len(seen), n_sec3 - 1)
+        sec3_map.append(seen[off])
+    return sec3_map
 
 
 def _remote_scan_storage_options(file_path: str, storage_options: Dict[str, Any]) -> Dict[str, Any]:
@@ -1060,6 +1140,14 @@ def _build_zattrs(msg, dim_labels: List[str]) -> dict:
     -------
     dict
         Zarr ``.zattrs`` metadata.
+
+    Notes
+    -----
+    ``level`` and ``valueOfFirstFixedSurface`` describe the representative
+    message.  They are meaningful only when the variable holds a single level;
+    :meth:`ReferenceGenerator._build_variable_refs` removes them for variables
+    that span a level dimension, where the level coordinate carries the values
+    instead.
     """
     # Extract typeOfFirstFixedSurface - handle Grib2Metadata objects
     type_of_first_fixed_surface = msg.typeOfFirstFixedSurface
@@ -1330,10 +1418,108 @@ def _map_messages_to_dimensions(
     }
 
 
+# CF attributes for vertical coordinates, keyed by GRIB2 Table 4.5
+# typeOfFirstFixedSurface.  Values are ``(standard_name, positive)``; either
+# element may be ``None`` when CF does not define it.  Units are read from
+# Table 4.5 itself rather than duplicated here.
+#
+# Single-valued surfaces (mean sea level, tropopause, planetary boundary layer,
+# entire atmosphere) are deliberately absent: they are labels rather than
+# measurable vertical coordinates, and the CF standard names that sound
+# applicable — air_pressure_at_mean_sea_level, for instance — belong to the data
+# variable, not to the coordinate it sits on.  Those surfaces still receive
+# units and a long_name from Table 4.5.
+_CF_LEVEL_ATTRS: Dict[int, tuple] = {
+    100: ("air_pressure", "down"),          # isobaric surface
+    102: ("altitude", "up"),                # specific altitude above mean sea level
+    103: ("height", "up"),                  # specified height above ground
+    # CF's atmosphere_sigma_coordinate and
+    # atmosphere_hybrid_sigma_pressure_coordinate are parametric and require
+    # formula_terms referencing the surface-pressure and coefficient variables.
+    # Those are not present in a kerchunk manifest, so claiming the
+    # standard_name without them would be non-conformant.  Direction alone is
+    # both safe and useful.
+    104: (None, "down"),                    # sigma level
+    105: (None, "down"),                    # hybrid level
+    106: ("depth", "down"),                 # depth below land surface
+    107: ("air_potential_temperature", "up"),   # isentropic (theta) level
+    108: ("air_pressure", "down"),          # pressure difference from ground
+    109: ("ertel_potential_vorticity", "up"),   # potential vorticity surface
+    160: ("depth", "down"),                 # depth below sea level
+}
+
+
+def _level_coord_attrs(msg, dim_name: str) -> dict:
+    """Build CF attributes for a vertical coordinate variable.
+
+    A vertical coordinate carrying only ``_ARRAY_DIMENSIONS`` is not
+    CF-conformant and leaves a consumer unable to distinguish Pa from hPa
+    except by inspecting the magnitude of the values.  Units and a description
+    come from Table 4.5, which grib2io already loads; ``standard_name`` and
+    ``positive`` come from :data:`_CF_LEVEL_ATTRS` where CF defines them.
+
+    Parameters
+    ----------
+    msg : Grib2Message
+        Representative message for the variable using this coordinate.
+    dim_name : str
+        Coordinate name, used only as a ``long_name`` fallback.
+
+    Returns
+    -------
+    dict
+        Attributes to merge into the coordinate's ``.zattrs``.  Empty when the
+        surface type cannot be determined.
+    """
+    toffs = getattr(msg, "typeOfFirstFixedSurface", None)
+    if toffs is None:
+        return {}
+    val = getattr(toffs, "value", toffs)
+    try:
+        val = int(val)
+    except (TypeError, ValueError):
+        return {}
+
+    attrs: Dict[str, Any] = {}
+
+    # Units and a human-readable description from Table 4.5, whose entries are
+    # ``[definition, units]``.  "unknown" units are omitted rather than emitted
+    # literally, since an explicit "unknown" is worse than a missing attribute.
+    try:
+        entry = grib2io.tables.get_table("4.5").get(str(val))
+    except Exception:
+        entry = None
+    if entry:
+        description = str(entry[0]) if len(entry) > 0 else ""
+        units = str(entry[1]) if len(entry) > 1 else ""
+        if units and units.lower() != "unknown":
+            attrs["units"] = units
+        if description:
+            attrs["long_name"] = description
+
+    if "long_name" not in attrs:
+        attrs["long_name"] = dim_name.replace("_", " ")
+
+    cf = _CF_LEVEL_ATTRS.get(val)
+    if cf:
+        standard_name, positive = cf
+        if standard_name:
+            attrs["standard_name"] = standard_name
+        if positive:
+            attrs["positive"] = positive
+
+    # Retain the GRIB2-native surface code alongside the CF vocabulary, for the
+    # same reason the data variables keep theirs.
+    attrs["typeOfFirstFixedSurface"] = val
+    return attrs
+
+
 def _build_coord_refs(
     dim_name: str,
     values: list,
     refs: Dict[str, Any],
+    msg=None,
+    level_dim_name: Optional[str] = None,
 ) -> None:
     """Build inline base64-encoded coordinate array refs.
 
@@ -1345,6 +1531,14 @@ def _build_coord_refs(
         Sorted unique coordinate values.
     refs : dict
         The refs dict to populate.
+    msg : Grib2Message, optional
+        Representative message, used to derive CF attributes for the vertical
+        coordinate.  When omitted the coordinate is written without them, which
+        preserves the previous behaviour.
+    level_dim_name : str, optional
+        Name of the vertical dimension for the variable being written.  Only
+        the coordinate matching this name receives vertical-coordinate
+        attributes.
     """
     if values and isinstance(values[0], tuple):
         # Level-type coordinate: values are (v1, v2) tuples; use v1
@@ -1384,11 +1578,32 @@ def _build_coord_refs(
     refs[f"{dim_name}/.zarray"] = json.dumps(coord_zarray)
 
     # .zattrs for the coordinate
-    coord_zattrs: dict = {"_ARRAY_DIMENSIONS": [dim_name]}
+    coord_zattrs: Dict[str, Any] = {"_ARRAY_DIMENSIONS": [dim_name]}
     if dim_name == "valid_time":
         # CF-compliant time metadata so xarray decodes int64 ns as datetime64
         coord_zattrs["units"] = "nanoseconds since 1970-01-01T00:00:00"
         coord_zattrs["calendar"] = "proleptic_gregorian"
+    elif dim_name == "duration":
+        coord_zattrs["units"] = "seconds"
+        coord_zattrs["long_name"] = "time period over which the field applies"
+    elif msg is not None and level_dim_name is not None and dim_name == level_dim_name:
+        # Vertical coordinate: CF requires units here, and the level
+        # description belongs on the coordinate rather than repeated (and
+        # wrong) on every data variable that uses it.
+        coord_zattrs.update(_level_coord_attrs(msg, dim_name))
+
+    # Several variables can share a level dimension, and this function is
+    # called once per variable.  Keep whichever attribute set is richer so a
+    # later, barer write does not strip metadata an earlier one supplied.
+    existing = refs.get(f"{dim_name}/.zattrs")
+    if existing is not None:
+        try:
+            prev = json.loads(existing)
+        except (TypeError, ValueError):
+            prev = {}
+        if len(prev) > len(coord_zattrs):
+            coord_zattrs = prev
+
     refs[f"{dim_name}/.zattrs"] = json.dumps(coord_zattrs)
 
     # Inline data chunk

@@ -246,7 +246,13 @@ def check_manifest(path, do_read=True):
 
     sample_url = next((r[0] for r in refs.values()
                        if isinstance(r, list) and len(r) == 3), "")
-    proto = "file" if sample_url.startswith("file://") else "https"
+    # Refs may be absolute file:// URIs, bare relative paths (as in the demo
+    # manifests, which reference data/ alongside the JSON), or remote URLs.
+    # Only the last needs the HTTP filesystem.
+    if sample_url.startswith(("http://", "https://", "s3://")):
+        proto = sample_url.split("://", 1)[0]
+    else:
+        proto = "file"
     try:
         fs = fsspec.filesystem("reference", fo=manifest,
                                remote_protocol=proto, skip_instance_cache=True)

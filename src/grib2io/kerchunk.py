@@ -125,6 +125,11 @@ class ReferenceGenerator:
     storage_options : dict, optional
         Extra options passed to ``fsspec.open`` for remote URIs
         (e.g. ``{"anon": True}`` for public S3 buckets).
+    validate : bool, default True
+        Check the finished manifest for internal consistency before returning
+        it, and raise :class:`ValueError` if any variable's dimension lengths
+        disagree with the coordinate arrays it references.  Pass ``False`` to
+        emit the manifest regardless.
     """
 
     def __init__(
@@ -133,6 +138,7 @@ class ReferenceGenerator:
         filters: Optional[Dict[str, Any]] = None,
         storage_options: Optional[Dict[str, Any]] = None,
         max_workers: Optional[int] = None,
+        validate: bool = True,
     ):
         _ensure_numcodecs()
 
@@ -152,6 +158,7 @@ class ReferenceGenerator:
         self.filters = filters or {}
         self.storage_options = storage_options or {}
         self.max_workers = max_workers
+        self.validate = validate
         self._manifest: Optional[dict] = None
 
     def generate(self) -> dict:
@@ -212,7 +219,11 @@ class ReferenceGenerator:
         # type but different level extents get disambiguated names (mirrors
         # how the xarray backend keeps each surface type in its own Dataset).
         used_var_names: Dict[str, int] = {}
-        level_coord_registry: Dict[str, list] = {}  # name -> sorted level values
+        # Emitted dimension name -> coordinate values written under it.  Shared
+        # across every variable so that two variables needing different values
+        # for the same dimension get distinct names instead of one silently
+        # overwriting the other's coordinate array.
+        dim_coord_registry: Dict[str, list] = {}
         for group_key, msg_entries in all_var_messages.items():
             var_name = group_key[0]  # shortName is the first element
             if var_name in used_var_names:
@@ -221,7 +232,7 @@ class ReferenceGenerator:
             else:
                 used_var_names[var_name] = 0
                 zarr_var_name = var_name
-            self._build_variable_refs(zarr_var_name, msg_entries, refs, level_coord_registry)
+            self._build_variable_refs(zarr_var_name, msg_entries, refs, dim_coord_registry)
 
         # Build latitude/longitude coordinate arrays from the grid definition.
         # All messages are assumed to share the same grid (required by the
@@ -236,6 +247,11 @@ class ReferenceGenerator:
             # separated from its filename carries no record of which model,
             # center, or cycle it describes.
             refs[".zattrs"] = json.dumps(_build_root_zattrs(rep_msg))
+
+        if self.validate:
+            problems = _validate_refs(refs)
+            if problems:
+                raise ValueError(_format_validation_errors(problems))
 
         self._manifest = {"version": 1, "refs": refs}
         return self._manifest
@@ -572,36 +588,24 @@ class ReferenceGenerator:
         var_name: str,
         msg_entries: list,
         refs: Dict[str, Any],
-        level_coord_registry: Optional[Dict[str, list]] = None,
+        dim_coord_registry: Optional[Dict[str, list]] = None,
     ) -> None:
         """Build all Zarr refs for a single variable."""
-        # Derive surface-type-specific level dim name (mirrors xarray_backend)
-        level_name = _level_dim_name(msg_entries[0].msg)
-        # Map messages to dimensions
-        dim_mapping = _map_messages_to_dimensions(msg_entries, level_dim_name=level_name)
+        # Derive surface-type-specific level dim name (mirrors xarray_backend).
+        level_base = _level_dim_name(msg_entries[0].msg)
+        dim_mapping = _map_messages_to_dimensions(msg_entries, level_dim_name=level_base)
 
-        # Disambiguate the level dim name if this surface type already appears
-        # in the manifest with different level values.  This prevents xarray
-        # from seeing conflicting dimension sizes when variables at the same
-        # surface type have different level counts.
-        if level_coord_registry is not None and level_name in dim_mapping["dim_values"]:
-            level_vals = dim_mapping["dim_values"][level_name]
-            if level_name in level_coord_registry:
-                if level_coord_registry[level_name] != level_vals:
-                    # Same surface type, different level values — append suffix
-                    suffix = 2
-                    candidate = f"{level_name}_{suffix}"
-                    while candidate in level_coord_registry and level_coord_registry[candidate] != level_vals:
-                        suffix += 1
-                        candidate = f"{level_name}_{suffix}"
-                    level_name = candidate
-                    dim_mapping = _map_messages_to_dimensions(msg_entries, level_dim_name=level_name)
-            if level_name not in level_coord_registry:
-                level_coord_registry[level_name] = dim_mapping["dim_values"].get(level_name, [])
+        dim_names = dim_mapping["dim_names"]      # ordered, using base names
+        dim_values = dim_mapping["dim_values"]    # base name -> sorted unique values
+        msg_index_map = dim_mapping["msg_index_map"]
 
-        dim_names = dim_mapping["dim_names"]  # ordered list of dim names
-        dim_values = dim_mapping["dim_values"]  # dict: dim_name -> sorted unique values
-        msg_index_map = dim_mapping["msg_index_map"]  # dict: dim_tuple -> msg_entry index
+        # Resolve every non-spatial dimension against the shared registry, not
+        # just the level one.  Two variables can disagree on the extent of any
+        # of them -- NBM, for example, emits CWASP over 7 percentiles and CAPE
+        # over 3 -- and whichever is written second would otherwise overwrite
+        # the first's coordinate array, leaving the manifest unopenable.
+        rename = _resolve_dim_names(dim_names, dim_values, dim_coord_registry)
+        emitted = [rename[d] for d in dim_names]
 
         # Representative message for metadata
         rep_msg = msg_entries[0].msg
@@ -616,7 +620,7 @@ class ReferenceGenerator:
         refs[f"{var_name}/.zarray"] = json.dumps(zarray)
 
         # Build .zattrs
-        dim_labels = dim_names + ["y", "x"]
+        dim_labels = emitted + ["y", "x"]
         zattrs = _build_zattrs(rep_msg, dim_labels)
 
         # ``level`` and ``valueOfFirstFixedSurface`` describe the representative
@@ -625,8 +629,8 @@ class ReferenceGenerator:
         # every other one, so a consumer reading attributes instead of the
         # coordinate array is misled (e.g. a 41-level pressure array labelled
         # "0.01 mb").  Drop them here and let the level coordinate carry the
-        # information instead — see _build_coord_refs / _level_coord_attrs.
-        n_levels = len(dim_values.get(level_name, ()))
+        # information instead -- see _build_coord_refs / _level_coord_attrs.
+        n_levels = len(dim_values.get(level_base, ()))
         if n_levels > 1:
             for _key in ("level", "valueOfFirstFixedSurface"):
                 zattrs.pop(_key, None)
@@ -654,10 +658,19 @@ class ReferenceGenerator:
                 entry.sec5_length + entry.sec6_length + entry.sec7_length,
             ]
 
-        # Build coordinate arrays as inline base64-encoded refs
-        for dim_name in dim_names:
-            values = dim_values[dim_name]
-            _build_coord_refs(dim_name, values, refs, msg=rep_msg, level_dim_name=level_name)
+        # Build coordinate arrays as inline base64-encoded refs.  The emitted
+        # name may be suffixed, so pass the base name too: the value encoding
+        # and CF attributes are chosen from what the dimension *is*, not from
+        # what it ended up being called.
+        for d in dim_names:
+            _build_coord_refs(
+                rename[d],
+                dim_values[d],
+                refs,
+                msg=rep_msg,
+                is_level=(d == level_base),
+                base_name=d,
+            )
 
     # ------------------------------------------------------------------
     # Manifest access
@@ -1514,48 +1527,110 @@ def _level_coord_attrs(msg, dim_name: str) -> dict:
     return attrs
 
 
+def _resolve_dim_names(
+    dim_names: List[str],
+    dim_values: Dict[str, list],
+    registry: Optional[Dict[str, list]],
+) -> Dict[str, str]:
+    """Map each dimension to the name it should be emitted under.
+
+    A kerchunk manifest is a single flat Zarr group, so a dimension name means
+    one thing across the whole file.  Variables within a GRIB2 file frequently
+    disagree about a dimension's extent -- different pressure-level sets, some
+    fields at 7 percentiles and others at 3, accumulations over different
+    windows -- and whichever variable is written last would otherwise overwrite
+    the coordinate array, leaving earlier variables pointing at a coordinate of
+    the wrong length.  xarray then refuses to open the dataset.
+
+    Any dimension whose values differ from what the registry already holds is
+    given a numeric suffix ('percentileValue_2'), matching how the xarray
+    backend keeps each surface type in its own Dataset.  Dimensions whose
+    values match an existing entry share it, so unrelated variables at the same
+    levels continue to use one coordinate.
+
+    Parameters
+    ----------
+    dim_names : list of str
+        Base dimension names for this variable, in order.
+    dim_values : dict
+        Base dimension name -> sorted unique coordinate values.
+    registry : dict or None
+        Emitted name -> values already written to the manifest.  Updated in
+        place.  When ``None``, names pass through unchanged.
+
+    Returns
+    -------
+    dict
+        Base dimension name -> emitted dimension name.
+    """
+    out: Dict[str, str] = {}
+    for d in dim_names:
+        if registry is None:
+            out[d] = d
+            continue
+        vals = dim_values.get(d, [])
+        name = d
+        if name in registry and registry[name] != vals:
+            suffix = 2
+            candidate = f"{d}_{suffix}"
+            while candidate in registry and registry[candidate] != vals:
+                suffix += 1
+                candidate = f"{d}_{suffix}"
+            name = candidate
+        if name not in registry:
+            registry[name] = vals
+        out[d] = name
+    return out
+
+
 def _build_coord_refs(
     dim_name: str,
     values: list,
     refs: Dict[str, Any],
     msg=None,
-    level_dim_name: Optional[str] = None,
+    is_level: bool = False,
+    base_name: Optional[str] = None,
 ) -> None:
     """Build inline base64-encoded coordinate array refs.
 
     Parameters
     ----------
     dim_name : str
-        Coordinate/dimension name.
+        Name the coordinate is emitted under.  May carry a numeric suffix
+        assigned by :func:`_resolve_dim_names`.
     values : list
         Sorted unique coordinate values.
     refs : dict
         The refs dict to populate.
     msg : Grib2Message, optional
         Representative message, used to derive CF attributes for the vertical
-        coordinate.  When omitted the coordinate is written without them, which
-        preserves the previous behaviour.
-    level_dim_name : str, optional
-        Name of the vertical dimension for the variable being written.  Only
-        the coordinate matching this name receives vertical-coordinate
-        attributes.
+        coordinate.  When omitted the coordinate is written without them.
+    is_level : bool, default False
+        Whether this is the variable's vertical dimension.  Only that
+        coordinate receives vertical-coordinate attributes.
+    base_name : str, optional
+        Unsuffixed dimension name.  Value encoding and the time/duration
+        attributes are chosen from this, so that a renamed dimension such as
+        ``valid_time_2`` is still encoded as datetime64 rather than falling
+        through to the float64 default.  Defaults to *dim_name*.
     """
+    base = base_name or dim_name
     if values and isinstance(values[0], tuple):
         # Level-type coordinate: values are (v1, v2) tuples; use v1
         coord_values = np.array(
             [v[0] if isinstance(v, tuple) else float(v) for v in values],
             dtype=np.float64,
         )
-    elif dim_name == "valid_time":
+    elif base == "valid_time":
         # Store as int64 nanoseconds since epoch so xarray decodes as datetime64
         ns_vals = [int(np.datetime64(v, "ns").astype(np.int64)) for v in values]
         coord_values = np.array(ns_vals, dtype=np.int64)
-    elif dim_name == "duration":
+    elif base == "duration":
         # Store as float seconds
         coord_values = np.array(values, dtype=np.float64)
-    elif dim_name == "perturbationNumber":
+    elif base == "perturbationNumber":
         coord_values = np.array(values, dtype=np.int32)
-    elif dim_name == "percentileValue":
+    elif base == "percentileValue":
         coord_values = np.array(values, dtype=np.float64)
     else:
         coord_values = np.array(values, dtype=np.float64)
@@ -1579,14 +1654,19 @@ def _build_coord_refs(
 
     # .zattrs for the coordinate
     coord_zattrs: Dict[str, Any] = {"_ARRAY_DIMENSIONS": [dim_name]}
-    if dim_name == "valid_time":
+    if base == "valid_time":
         # CF-compliant time metadata so xarray decodes int64 ns as datetime64
         coord_zattrs["units"] = "nanoseconds since 1970-01-01T00:00:00"
         coord_zattrs["calendar"] = "proleptic_gregorian"
-    elif dim_name == "duration":
+    elif base == "duration":
         coord_zattrs["units"] = "seconds"
         coord_zattrs["long_name"] = "time period over which the field applies"
-    elif msg is not None and level_dim_name is not None and dim_name == level_dim_name:
+    elif base == "percentileValue":
+        coord_zattrs["units"] = "%"
+        coord_zattrs["long_name"] = "percentile"
+    elif base == "perturbationNumber":
+        coord_zattrs["long_name"] = "ensemble member number"
+    elif msg is not None and is_level:
         # Vertical coordinate: CF requires units here, and the level
         # description belongs on the coordinate rather than repeated (and
         # wrong) on every data variable that uses it.
@@ -1608,6 +1688,90 @@ def _build_coord_refs(
 
     # Inline data chunk
     refs[f"{dim_name}/0"] = "base64:" + b64_data
+
+
+def _validate_refs(refs: Dict[str, Any]) -> List[tuple]:
+    """Check a finished manifest for internal consistency.
+
+    A kerchunk manifest is only useful if it can be opened.  The failure mode
+    worth catching here is a variable whose array shape disagrees with the
+    length of a coordinate it names: the manifest serializes cleanly, uploads
+    cleanly, and then fails at ``xr.open_dataset`` with a conflicting-sizes
+    error that names the variables but not the cause.  Catching it at
+    generation time turns a downstream mystery into an immediate, local error.
+
+    Parameters
+    ----------
+    refs : dict
+        The finished ``refs`` mapping.
+
+    Returns
+    -------
+    list of tuple
+        ``(variable, dimension, variable_length, coordinate_length)`` for each
+        mismatch found.  Empty when the manifest is self-consistent.
+    """
+    # Lengths of the 1-D coordinate arrays.  latitude/longitude are 2-D and are
+    # not dimensions, so they are skipped.
+    coord_len: Dict[str, int] = {}
+    for key, val in refs.items():
+        if not key.endswith("/.zarray") or key.count("/") != 1:
+            continue
+        try:
+            shape = json.loads(val)["shape"]
+        except (TypeError, ValueError, KeyError):
+            continue
+        if len(shape) == 1:
+            coord_len[key.split("/")[0]] = int(shape[0])
+
+    problems: List[tuple] = []
+    for key, val in refs.items():
+        if not key.endswith("/.zattrs") or key.count("/") != 1:
+            continue
+        name = key.split("/")[0]
+        try:
+            attrs = json.loads(val)
+        except (TypeError, ValueError):
+            continue
+        if "shortName" not in attrs:
+            continue  # coordinate, not a data variable
+        zarray_key = f"{name}/.zarray"
+        if zarray_key not in refs:
+            continue
+        try:
+            shape = json.loads(refs[zarray_key])["shape"]
+        except (TypeError, ValueError, KeyError):
+            continue
+        for dim, length in zip(attrs.get("_ARRAY_DIMENSIONS", []), shape):
+            if dim in coord_len and coord_len[dim] != int(length):
+                problems.append((name, dim, int(length), coord_len[dim]))
+
+    return problems
+
+
+def _format_validation_errors(problems: List[tuple], limit: int = 10) -> str:
+    """Render :func:`_validate_refs` output as an actionable error message."""
+    dims = sorted({p[1] for p in problems})
+    lines = [
+        f"Manifest is internally inconsistent: {len(problems)} variable/dimension "
+        f"pairs disagree with their coordinate arrays.",
+        f"Affected dimensions: {', '.join(dims)}",
+        "",
+    ]
+    for var, dim, got, expected in problems[:limit]:
+        lines.append(f"  {var}: dimension '{dim}' has length {got}, "
+                     f"but the coordinate array has length {expected}")
+    if len(problems) > limit:
+        lines.append(f"  ... and {len(problems) - limit} more")
+    lines += [
+        "",
+        "This manifest would fail to open with xarray.  It usually means two "
+        "variables need different values for the same dimension and one "
+        "overwrote the other's coordinate array; _resolve_dim_names should "
+        "have given them distinct names.",
+        "Pass validate=False to ReferenceGenerator to emit it anyway.",
+    ]
+    return "\n".join(lines)
 
 
 def _build_latlon_coord_refs(msg, refs: Dict[str, Any]) -> None:

@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import re
 import sys
 from collections import Counter
 
@@ -42,6 +43,20 @@ EXPECTED_ROOT = [
 
 NON_LEVEL_DIMS = {"valid_time", "duration", "percentileValue",
                   "perturbationNumber", "y", "x", "latitude", "longitude"}
+
+
+def base_dim(name):
+    """Strip the disambiguation suffix: 'percentileValue_2' -> 'percentileValue'.
+
+    _resolve_dim_names appends _2, _3 ... when two variables need different
+    values for the same dimension, so classification must be done on the base
+    name or a suffixed percentile dimension looks like a vertical coordinate.
+    """
+    return re.sub(r"_\d+$", "", name)
+
+
+def is_level_dim(name):
+    return base_dim(name) not in NON_LEVEL_DIMS
 
 GDT_NAMES = {0: "Latitude/Longitude (regular)", 10: "Mercator",
              20: "Polar stereographic", 30: "Lambert conformal",
@@ -67,7 +82,7 @@ def level_dim_of(attrs, var):
         if d in attrs and "typeOfFirstFixedSurface" in attrs[d]:
             return d
     for d in dims:
-        if d in attrs and d not in NON_LEVEL_DIMS:
+        if d in attrs and is_level_dim(d):
             return d
     return None
 
@@ -177,7 +192,7 @@ def check_manifest(path, do_read=True):
               f"{single_ok}/{n_single}")
 
     # 4. level coordinate metadata ----------------------------------------
-    lev_coords = {k: a for k, a in coords.items() if k not in NON_LEVEL_DIMS}
+    lev_coords = {k: a for k, a in coords.items() if is_level_dim(k)}
     with_units = sum(1 for a in lev_coords.values() if "units" in a)
     with_toffs = sum(1 for a in lev_coords.values()
                      if "typeOfFirstFixedSurface" in a)
@@ -213,8 +228,7 @@ def check_manifest(path, do_read=True):
               f"{len(bad)} mismatches: {bad[:3]}" if bad else "consistent")
 
     # report any suffixed dimensions, which is where collisions were resolved
-    suffixed = sorted(d for d in coords
-                      if d.rsplit("_", 1)[-1].isdigit() and d not in NON_LEVEL_DIMS)
+    suffixed = sorted(d for d in coords if re.search(r"_\d+$", d))
     rep.note("disambiguated dimensions",
              f"{len(suffixed)}" + (f": {suffixed[:6]}" if suffixed else ""))
 
@@ -236,9 +250,18 @@ def check_manifest(path, do_read=True):
     try:
         fs = fsspec.filesystem("reference", fo=manifest,
                                remote_protocol=proto, skip_instance_cache=True)
-        ds = xr.open_dataset(fs.get_mapper(""), engine="zarr",
-                             backend_kwargs={"consolidated": False}, chunks={})
-        rep.check(True, "opens with xarray", f"{len(ds.data_vars)} variables")
+        try:
+            ds = xr.open_dataset(fs.get_mapper(""), engine="zarr",
+                                 backend_kwargs={"consolidated": False},
+                                 chunks={})
+            mode = "dask-backed"
+        except ImportError:
+            # dask is optional; without it xarray loads eagerly, which is fine
+            # for the small slice this script reads.
+            ds = xr.open_dataset(fs.get_mapper(""), engine="zarr",
+                                 backend_kwargs={"consolidated": False})
+            mode = "eager (no dask)"
+        rep.check(True, "opens with xarray", f"{len(ds.data_vars)} variables, {mode}")
     except Exception as e:
         rep.check(False, "opens with xarray", f"{type(e).__name__}: {e}")
         return rep

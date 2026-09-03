@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import itertools
 import json
 import re
 import sys
@@ -281,13 +282,22 @@ def check_manifest(path, do_read=True):
                    if v in ds.data_vars), sorted(ds.data_vars)[0])
     try:
         da = ds[target]
-        sel = {d: 0 for d in da.dims if d not in ("y", "x")}
         # Each chunk is the full grid, so slicing a corner window reads the
         # same bytes but can land entirely inside the bitmap-masked region
-        # (Alaska NDFD grids mask the [0:50, 0:50] corner).  Read the whole
-        # 2-D field and judge from every point.
-        vals = np.asarray(da.isel(**sel).compute().values)
-        finite = vals[np.isfinite(vals)]
+        # (Alaska NDFD grids mask the [0:50, 0:50] corner).  Read whole 2-D
+        # fields and judge from every point.  And a sparse dimension cross
+        # product (e.g. two accumulation windows where not every valid_time
+        # carries both, as in uvi DSWRF) legitimately leaves whole chunks
+        # NaN-filled, so try index combinations until one holds data.
+        free = [d for d in da.dims if d not in ("y", "x")]
+        finite = np.array([])
+        for combo in itertools.islice(
+                itertools.product(*(range(min(da.sizes[d], 3)) for d in free)),
+                12):
+            vals = np.asarray(da.isel(dict(zip(free, combo))).compute().values)
+            finite = vals[np.isfinite(vals)]
+            if finite.size:
+                break
         if finite.size == 0:
             rep.check(False, f"byte-range read ({target})",
                       "no finite values (fully masked or undecodable)")

@@ -282,13 +282,24 @@ def check_manifest(path, do_read=True):
     try:
         da = ds[target]
         sel = {d: 0 for d in da.dims if d not in ("y", "x")}
-        arr = da.isel(**sel).isel(y=slice(0, 50), x=slice(0, 50)).compute()
-        vals = np.asarray(arr.values)
+        # Each chunk is the full grid, so slicing a corner window reads the
+        # same bytes but can land entirely inside the bitmap-masked region
+        # (Alaska NDFD grids mask the [0:50, 0:50] corner).  Read the whole
+        # 2-D field and judge from every point.
+        vals = np.asarray(da.isel(**sel).compute().values)
         finite = vals[np.isfinite(vals)]
-        ok = finite.size > 0
-        rep.check(ok, f"byte-range read ({target})",
-                  f"min {finite.min():.3f} max {finite.max():.3f} "
-                  f"{da.attrs.get('units','')}" if ok else "no finite values")
+        if finite.size == 0:
+            rep.check(False, f"byte-range read ({target})",
+                      "no finite values (fully masked or undecodable)")
+        else:
+            lo, hi = float(finite.min()), float(finite.max())
+            # A field whose every finite value is a GRIB missing-value
+            # sentinel decoded fine but masked nothing: 9999-family or
+            # 9.999e20-family constants are encoding artifacts, not physics.
+            sentinel = (lo == hi and (9998.0 <= lo <= 10000.0 or lo >= 1e19))
+            rep.check(not sentinel, f"byte-range read ({target})",
+                      f"min {lo:.3f} max {hi:.3f} {da.attrs.get('units','')}"
+                      + (" — constant missing-value sentinel" if sentinel else ""))
     except Exception as e:
         rep.check(False, f"byte-range read ({target})", f"{type(e).__name__}: {e}")
 

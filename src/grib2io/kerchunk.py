@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import re
+import warnings
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional, Set, Union
 
@@ -598,6 +599,7 @@ class ReferenceGenerator:
         dim_names = dim_mapping["dim_names"]      # ordered, using base names
         dim_values = dim_mapping["dim_values"]    # base name -> sorted unique values
         msg_index_map = dim_mapping["msg_index_map"]
+        duplicate_entry_indices = dim_mapping["duplicate_entry_indices"]
 
         # Resolve every non-spatial dimension against the shared registry, not
         # just the level one.  Two variables can disagree on the extent of any
@@ -671,6 +673,26 @@ class ReferenceGenerator:
                 is_level=(d == level_base),
                 base_name=d,
             )
+
+        # Re-emit any messages whose identifying metadata exactly collided
+        # with an earlier message as a sibling variable, so no message's
+        # bytes are silently dropped from the manifest.  smartinit, for
+        # example, encodes a 1-bit binary field whose PDT is byte-identical
+        # to the real surface TMP message; only the packing (Section 5)
+        # differs.  Which message is "the" variable and which is the
+        # duplicate is file-order and cannot be determined from metadata,
+        # hence the warning telling consumers to inspect both.
+        if duplicate_entry_indices:
+            dup_entries = [msg_entries[i] for i in duplicate_entry_indices]
+            dup_name = f"{var_name}_dup"
+            warnings.warn(
+                f"{len(dup_entries)} message(s) share identical identifying "
+                f"metadata with an earlier '{var_name}' message; emitting "
+                f"them as '{dup_name}'.  The GRIB2 encoding of these "
+                f"products is ambiguous; inspect both variables to "
+                f"determine which is the intended field."
+            )
+            self._build_variable_refs(dup_name, dup_entries, refs, dim_coord_registry)
 
     # ------------------------------------------------------------------
     # Manifest access
@@ -1367,6 +1389,8 @@ def _map_messages_to_dimensions(
         - ``"dim_names"``: ordered list of active dimension names
         - ``"dim_values"``: dict mapping dim name to sorted unique values
         - ``"msg_index_map"``: dict mapping dim-value tuple to entry index
+        - ``"duplicate_entry_indices"``: indices of entries whose dim-value
+          tuple exactly collided with an earlier entry's
     """
     # Build ordered dim names, substituting the surface-type-specific level name
     ordered_dims = [level_dim_name if d == "level" else d for d in _ORDERED_DIM_NAMES]
@@ -1417,17 +1441,28 @@ def _map_messages_to_dimensions(
     # Remap back so callers can use dim_names as coordinate keys directly
     # (level_dim_name is already baked in via ordered_dims)
 
-    # Build the mapping from dimension-value tuples to entry indices
+    # Build the mapping from dimension-value tuples to entry indices.
+    # Two messages can carry fully identical identifying metadata (same
+    # parameter, level, lead time, PDT) yet contain different data --
+    # smartinit encodes a 1-bit binary field with the same IDs as the real
+    # surface TMP.  Overwriting would silently drop the earlier message's
+    # bytes from the manifest, so collisions are collected for the caller
+    # to emit as a separate variable instead.
     msg_index_map: Dict[tuple, int] = {}
+    duplicate_entry_indices: List[int] = []
     for idx, entry in enumerate(msg_entries):
         msg = entry.msg
         dim_tuple = tuple(_get_dim_value(msg, "level" if d == level_dim_name else d) for d in active_dims)
-        msg_index_map[dim_tuple] = idx
+        if dim_tuple in msg_index_map:
+            duplicate_entry_indices.append(idx)
+        else:
+            msg_index_map[dim_tuple] = idx
 
     return {
         "dim_names": active_dims,
         "dim_values": dim_values,
         "msg_index_map": msg_index_map,
+        "duplicate_entry_indices": duplicate_entry_indices,
     }
 
 

@@ -213,6 +213,19 @@ class ReferenceGenerator:
                 except Exception as e:
                     raise ValueError(f"Failed to parse GRIB2 file '{file_path}': {e}") from e
 
+        # A file that yields no usable GRIB2 messages must not produce an
+        # empty-but-valid-looking manifest.  cdas and sref publish GRIB1
+        # under COM; scanning them collects nothing, and the previous
+        # behaviour wrote a hollow JSON (just .zgroup) that serialized
+        # cleanly and only failed downstream at open time.  Raising here
+        # matches the validate-before-writing contract.
+        if not all_var_messages:
+            raise ValueError(
+                f"No GRIB2 messages found in {self.file_paths}: the input "
+                f"is not GRIB2 (e.g. GRIB1), or the filters matched no "
+                f"messages.  Refusing to write an empty manifest."
+            )
+
         # For each variable group, map messages to dimensions and build refs.
         # Track used variable names to handle collisions (same shortName
         # but different surface types).
